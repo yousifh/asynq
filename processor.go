@@ -70,6 +70,8 @@ type processor struct {
 
 	starting chan<- *workerInfo
 	finished chan<- *base.TaskMessage
+
+	backoffSleep time.Duration
 }
 
 type processorParams struct {
@@ -88,6 +90,12 @@ type processorParams struct {
 	starting        chan<- *workerInfo
 	finished        chan<- *base.TaskMessage
 }
+
+const (
+	minBackoffSleep  = 100 * time.Millisecond
+	maxBackoffSleep  = 1000 * time.Millisecond
+	backoffIncrement = 100 * time.Millisecond
+)
 
 // newProcessor constructs a new processor.
 func newProcessor(params processorParams) *processor {
@@ -117,6 +125,7 @@ func newProcessor(params processorParams) *processor {
 		shutdownTimeout: params.shutdownTimeout,
 		starting:        params.starting,
 		finished:        params.finished,
+		backoffSleep:    maxBackoffSleep,
 	}
 }
 
@@ -179,7 +188,8 @@ func (p *processor) exec() {
 			// Sleep to avoid slamming redis and let scheduler move tasks into queues.
 			// Note: We are not using blocking pop operation and polling queues instead.
 			// This adds significant load to redis.
-			time.Sleep(time.Second)
+			p.incrementBackoffSleep()
+			time.Sleep(p.backoffSleep)
 			<-p.sema // release token
 			return
 		case err != nil:
@@ -188,6 +198,8 @@ func (p *processor) exec() {
 			}
 			<-p.sema // release token
 			return
+		default:
+			p.resetBackoffSleep()
 		}
 
 		lease := base.NewLease(leaseExpirationTime)
@@ -520,4 +532,15 @@ func (p *processor) computeDeadline(msg *base.TaskMessage) time.Time {
 		return p.clock.Now().Add(time.Duration(msg.Timeout) * time.Second)
 	}
 	return time.Unix(msg.Deadline, 0)
+}
+
+func (p *processor) incrementBackoffSleep() {
+	p.backoffSleep += backoffIncrement
+	if p.backoffSleep > maxBackoffSleep {
+		p.backoffSleep = maxBackoffSleep
+	}
+}
+
+func (p *processor) resetBackoffSleep() {
+	p.backoffSleep = minBackoffSleep
 }
